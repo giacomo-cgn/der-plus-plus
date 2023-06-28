@@ -1,25 +1,63 @@
 import numpy as np
+import random
 
-from avalanche.benchmarks.utils import AvalancheDataset
 from avalanche.core import SupervisedPlugin
-from avalanche.training.storage_policy import ReservoirSamplingBuffer 
-from torch.utils.data import DataLoader, TensorDataset
 
-import torch.nn.functional as F
 import torch
-
-# Use it instead of "iter(Dataloader)" because iter is not an infinite generator 
-# "iter()" raises StopIteration error when all buffer samples are used
-def cycle(iterable):
-    while True:
-        for x in iterable:
-            yield x
+import torch.nn.functional as F
 
 
+# Cusstom reservoir buffer class for samples, labels and logits
+class ReservoirBuffer:
+    def __init__(self, buffer_size):
+        self.buffer_size = buffer_size
+        self.buffer = []
+        self.stored_samples = 0
+
+    def add(self, batch_x, batch_y, batch_logits):
+        assert batch_x.size(0) == batch_y.size(0) == batch_logits.size(0)
+        batch_size = batch_x.size(0)
+
+        if self.stored_samples < self.buffer_size:
+            # Store samples until the buffer is full
+            if self.stored_samples + batch_size <= self.buffer_size:
+                # If there is enough space in the buffer, add all the samples
+                samples = [(batch_x[i], batch_y[i], batch_logits[i]) for i in range(batch_size)]
+                self.buffer.extend(samples)
+                self.stored_samples += batch_size
+            else:
+                # If there is not enough space, add only the remaining samples
+                remaining_space = self.buffer_size - self.stored_samples
+                samples = [(batch_x[i], batch_y[i], batch_logits[i]) for i in range(batch_size)]
+                self.buffer.extend(samples[:remaining_space])
+                self.stored_samples += remaining_space
+        else:
+            # Replace samples with probability buffer_size/stored_samples
+            for i in range(batch_size):
+                replace_index = random.randint(0, self.stored_samples)
+                if replace_index < self.buffer_size:
+                    self.buffer[replace_index] = (batch_x[i], batch_y[i], batch_logits[i])
+
+    def sample(self, batch_size):
+        assert batch_size <= self.stored_samples
+
+        # Sample batch_size indices
+        indices = random.sample(range(self.stored_samples), batch_size)
+        samples = [self.buffer[i] for i in indices]
+
+        # Stack each element of the tuples, each sample is a tuple of (x, y, logits)
+        batch_x = torch.stack([sample[0] for sample in samples])
+        batch_y = torch.stack([sample[1] for sample in samples])
+        batch_logits = torch.stack([sample[2] for sample in samples])
+
+        return batch_x, batch_y, batch_logits
+
+
+# DER plugin class
 class DerPlugin(SupervisedPlugin):
     def __init__(self, mem_size=200, replay_mb_size=32, alpha=0.5, beta=0.5):
         super().__init__()
-        self.buffer = ReservoirSamplingBuffer(max_size=mem_size)
+        self.buffer = ReservoirBuffer(mem_size)
         self.alpha = alpha
         self.beta = beta
         self.replay_mb_size = replay_mb_size
@@ -29,138 +67,63 @@ class DerPlugin(SupervisedPlugin):
         else:
             self.use_der_plus = True
 
-
-    def before_training_exp(self, strategy: "SupervisedTemplate", num_workers: int = 0, **kwargs):
-        self.exp_x, self.exp_y, self.exp_logits = [], [], []
-
+    def before_training_exp(self, strategy: "SupervisedTemplate", **kwargs):
         if len(self.buffer.buffer) == 0:
             # First experience. We don't use the buffer.
             self.first_experience = True
             return
         else:
             self.first_experience = False
-
-        # We create a dataloader from the buffer to sample the old experiences
-        self.old_exp_dataloader = cycle(
-            DataLoader(self.buffer.buffer, batch_size=self.replay_mb_size, shuffle=True, drop_last=True)   
-        ) 
-
         
-    def before_forward(self, strategy: "SupervisedTemplate", **kwargs):     
-        #print('MB size: ', len(strategy.mbatch))
+    def before_forward(self, strategy: "SupervisedTemplate", **kwargs):
         if self.first_experience:
-            self.original_batch_size = strategy.train_mb_size
-            # No replay for first experience, no need to change the batch
             return
 
-        # We concatenate the current batch with the batch from the buffer in order to do the forward pass.
-        # 2 batches are sampled from memory for DER++ (first batch for logits replay, second batch for DER++)
-
-        # Save the number of samples in the original (no replay) batch
-        self.original_batch_size = strategy.mbatch[0].size()[0]
-
         # Extract first batch for logits replay from old experiences
-        batch_x, _, batch_logits = next(self.old_exp_dataloader)
-        batch_x, batch_logits = (
-            batch_x.to(strategy.device),
-            batch_logits.to(strategy.device),
-        )
-        # Use only inputs and logits for first replay batch
-        strategy.mbatch[0] = torch.cat((strategy.mbatch[0], batch_x))
-        self.batch_logits = batch_logits
+        self.repl_batch_x, _, self.repl_batch_logits = self.buffer.sample(self.replay_mb_size)
 
         if self.use_der_plus:
             # Extract second batch for DER++
-            batch_x, batch_y, _ = next(self.old_exp_dataloader)
-            batch_x, batch_y = (
-                batch_x.to(strategy.device),
-                batch_y.to(strategy.device)
-            )
-            # Use only inputs and labels for second replay batch
-            strategy.mbatch[0] = torch.cat((strategy.mbatch[0], batch_x))
-            strategy.mbatch[1] = torch.cat((strategy.mbatch[1], batch_y))
-        
-        # print sizes of the batch
-        print('X size: ', strategy.mbatch[0].size())
-        print('Y size: ', strategy.mbatch[1].size())
-        print('Logits size: ', self.batch_logits.size())
+            repl2_batch_x, self.repl_batch_y, _ = self.buffer.sample(self.replay_mb_size)
+            self.repl_batch_x = torch.cat((self.repl_batch_x, repl2_batch_x))
 
+        self.repl_batch_x, self.repl_batch_y, self.repl_batch_logits = (
+            self.repl_batch_x.to(strategy.device).detach(),
+            self.repl_batch_y.to(strategy.device).detach(),
+            self.repl_batch_logits.to(strategy.device).detach(),
+        )
 
-        
-    def after_forward(self, strategy: "SupervisedTemplate", **kwargs):
-        # Store the not replayed part of the batch (current experience) for buffer update
-        # Save X, Y and logits
-        new_exp_betch = AvalancheDataset(TensorDataset(
-            strategy.mb_x[:self.original_batch_size],
-            strategy.mb_y[:self.original_batch_size],
-            strategy.mb_output[:self.original_batch_size]))
-
-        self.buffer.update_from_dataset(new_exp_betch, **kwargs)
+        # Forward on the replay batch
+        self.repl_output = strategy.model(self.repl_batch_x).detach()
 
     def before_backward(self, strategy: "SupervisedTemplate", **kwargs):
-        # We set the default criterion to 0 to avoid computing the loss twice
-        def void_criterion(*args, **kwargs):
-            return 0
-        strategy.criterion = void_criterion
-
         if self.first_experience:
-            # No replay for first experience, no need to use DER++ loss
-            strategy.loss =  F.cross_entropy(
-                strategy.mb_output[:self.original_batch_size],
-                strategy.mb_y[:self.original_batch_size],
-            )
-        elif self.use_der_plus:
-            # After first experience. We change the loss function to include DER++ loss
-            strategy.loss =  F.cross_entropy(
-                strategy.mb_output[:self.original_batch_size],
-                strategy.mb_y[:self.original_batch_size],
-            )
-            + self.alpha * F.mse_loss(
-                strategy.mb_output[self.original_batch_size:self.original_batch_size+self.replay_mb_size],
-                self.batch_logits,
-            ) 
-            + self.beta * F.cross_entropy(
-                strategy.mb_output[self.original_batch_size+self.replay_mb_size:],
-                strategy.mb_y[self.original_batch_size:],
-            )
-        else:
-            # After first experience. Only use DER loss
-            strategy.loss =  F.cross_entropy(
-                strategy.mb_output[:self.original_batch_size],
-                strategy.mb_y[:self.original_batch_size],
-            )
-            + self.alpha * F.mse_loss(
-                strategy.mb_output[self.original_batch_size:],
-                self.batch_logits,
-            )
+            return
+        # Compute the DER loss on the replay batch
+        der_loss = self.alpha * F.mse_loss(self.repl_output[:self.replay_mb_size], self.repl_batch_logits)
+        if self.use_der_plus:
+            # Add the DER++ loss
+            der_loss += self.beta* F.cross_entropy(self.repl_output[self.replay_mb_size:], self.repl_batch_y)
+
+        strategy.loss += der_loss
+
+    def after_training_iteration(self, strategy: "SupervisedTemplate", **kwargs):
+        # Add the current batch to the buffer
+       self.buffer.add(strategy.mb_x.detach(), strategy.mb_y.detach(), strategy.mb_output.detach())
 
 
-    def after_backward(self, strategy: "SupervisedTemplate", **kwargs):
-        if not self.first_experience:
-            # Restore the original batch (no replay)
-            strategy.mbatch[0] = strategy.mbatch[0][:self.original_batch_size]
-            strategy.mbatch[1] = strategy.mbatch[1][:self.original_batch_size]
+    # def after_training_exp(self, strategy: "SupervisedTemplate", **kwargs):
 
-            # Also cut the output to the original batch size
-            strategy.mb_output = strategy.mb_output[:self.original_batch_size]
+    #     print('Memory usage: ', torch.cuda.memory_allocated()/torch.cuda.max_memory_allocated()*100, '%')
 
-    # def after_training_iteration(self, strategy: "SupervisedTemplate", **kwargs):
-        # print sizes of the batch 
-        # print('original_batch_size: ', self.original_batch_size)
-        # print('X size: ', strategy.mbatch[0].size())
-        # print('Y size: ', strategy.mbatch[1].size())
-        # print("mb_output size: ", strategy.mb_output.size())
+    #     # print the number of unique labels in the buffer
+    #     print('BUFFER CLASSES INFO')
+    #     labels_list = []
+    #     for sample in self.buffer.buffer:
+    #         labels_list.append(sample[1].cpu().numpy())
+    #     # Get unique elements and their counts
+    #     unique_elements, counts = np.unique(labels_list, return_counts=True)
 
-
-    def after_training_exp(self, strategy: "SupervisedTemplate", **kwargs):
-        # print the number of unique labels in the buffer
-        print('Unique y in buffer: ', (self.buffer.buffer))
-        labels_list = []
-        for sample in self.buffer.buffer:
-            labels_list.append(sample[1].cpu().numpy())
-        # Get unique elements and their counts
-        unique_elements, counts = np.unique(labels_list, return_counts=True)
-
-        # Print unique elements and their counts
-        for element, count in zip(unique_elements, counts):
-            print(f"Element: {element}, Count: {count}")
+    #     # Print unique elements and their counts
+    #     for element, count in zip(unique_elements, counts):
+    #         print(f"Element: {element}, Count: {count}")
