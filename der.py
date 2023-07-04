@@ -6,6 +6,8 @@ from avalanche.core import SupervisedPlugin
 import torch
 import torch.nn.functional as F
 
+from torchvision.transforms import Compose, RandomCrop, RandomHorizontalFlip, ToTensor
+
 
 # Cusstom reservoir buffer class for samples, labels and logits
 class ReservoirBuffer:
@@ -59,11 +61,13 @@ class ReservoirBuffer:
 
 # DER plugin class
 class DerPlugin(SupervisedPlugin):
-    def __init__(self, mem_size=200, alpha=0.5, beta=0.5):
+    def __init__(self, mem_size=200, alpha=0.5, beta=0.5, transform=
+                 Compose([RandomCrop(size=(32, 32), padding=4), RandomHorizontalFlip(p=0.5)])):
         super().__init__()
         self.buffer = ReservoirBuffer(mem_size)
         self.alpha = alpha
         self.beta = beta
+        self.transform = transform
 
         if beta == 0:
             self.use_der_plus = False
@@ -71,6 +75,13 @@ class DerPlugin(SupervisedPlugin):
             self.use_der_plus = True
 
     def before_training_iteration(self, strategy: "SupervisedTemplate", **kwargs):
+        # Save untransformed input
+        self.original_input = strategy.mb_x.detach().clone()
+
+        # Apply transformation to input
+        strategy.mbatch[0] = self.transform(strategy.mb_x)
+
+        # Minibatch size
         self.batch_size = strategy.mb_x.size(0)
 
         if len(self.buffer.buffer) > self.batch_size:
@@ -80,7 +91,7 @@ class DerPlugin(SupervisedPlugin):
             # Not enough samples stored. We don't use the buffer.
             self.use_buffer = False
      
-    def before_forward(self, strategy: "SupervisedTemplate", **kwargs):
+    def after_forward(self, strategy: "SupervisedTemplate", **kwargs):
         if self.use_buffer:
 
             # Extract first batch for logits replay from old experiences
@@ -92,13 +103,16 @@ class DerPlugin(SupervisedPlugin):
                 self.repl_batch_x = torch.cat((self.repl_batch_x, repl2_batch_x))
 
             self.repl_batch_x, self.repl_batch_y, self.repl_batch_logits = (
-                self.repl_batch_x.to(strategy.device).detach(),
-                self.repl_batch_y.to(strategy.device).detach(),
-                self.repl_batch_logits.to(strategy.device).detach(),
+                self.repl_batch_x.to(strategy.device),
+                self.repl_batch_y.to(strategy.device),
+                self.repl_batch_logits.to(strategy.device),
             )
 
+            # Apply transformation to replay batch
+            self.repl_batch_x = self.transform(self.repl_batch_x)
+
             # Forward on the replay batch
-            self.repl_output = strategy.model(self.repl_batch_x).detach()
+            self.repl_output = strategy.model(self.repl_batch_x)
 
     def before_backward(self, strategy: "SupervisedTemplate", **kwargs):
         if self.use_buffer:
@@ -107,13 +121,13 @@ class DerPlugin(SupervisedPlugin):
             der_loss = self.alpha * F.mse_loss(self.repl_output[:self.batch_size], self.repl_batch_logits)
             if self.use_der_plus:
                 # Add the DER++ loss
-                der_loss += self.beta* F.cross_entropy(self.repl_output[self.batch_size:], self.repl_batch_y)
+                der_loss += self.beta * F.cross_entropy(self.repl_output[self.batch_size:], self.repl_batch_y)
 
             strategy.loss += der_loss
 
     def after_training_iteration(self, strategy: "SupervisedTemplate", **kwargs):
         # Add the current batch to the buffer
-       self.buffer.add(strategy.mb_x.detach(), strategy.mb_y.detach(), strategy.mb_output.detach())
+       self.buffer.add(self.original_input.detach(), strategy.mb_y.detach(), strategy.mb_output.detach())
 
 
     # Get the unique labels and their counts in the buffer
