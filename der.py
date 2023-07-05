@@ -6,7 +6,7 @@ from avalanche.core import SupervisedPlugin
 import torch
 import torch.nn.functional as F
 
-from torchvision.transforms import Compose, RandomCrop, RandomHorizontalFlip, ToTensor
+from torchvision.transforms import Compose, RandomCrop, RandomHorizontalFlip
 
 
 # Cusstom reservoir buffer class for samples, labels and logits
