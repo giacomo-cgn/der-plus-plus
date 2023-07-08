@@ -101,10 +101,12 @@ class DerPlugin(SupervisedPlugin):
                 # Extract second batch for DER++
                 repl2_batch_x, self.repl_batch_y, _ = self.buffer.sample(self.batch_size)
                 self.repl_batch_x = torch.cat((self.repl_batch_x, repl2_batch_x))
-
-            self.repl_batch_x, self.repl_batch_y, self.repl_batch_logits = (
+                # Replay labels to device
+                self.repl_batch_y = self.repl_batch_y.to(strategy.device)
+                
+            # Replay inputs and logits to device
+            self.repl_batch_x, self.repl_batch_logits = (
                 self.repl_batch_x.to(strategy.device),
-                self.repl_batch_y.to(strategy.device),
                 self.repl_batch_logits.to(strategy.device),
             )
 
