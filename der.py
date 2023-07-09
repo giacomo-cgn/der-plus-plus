@@ -62,7 +62,8 @@ class ReservoirBuffer:
 # DER plugin class
 class DerPlugin(SupervisedPlugin):
     def __init__(self, mem_size=200, alpha=0.5, beta=0.5, transform=
-                 Compose([RandomCrop(size=(32, 32), padding=4), RandomHorizontalFlip(p=0.5)])):
+                 Compose([RandomCrop(size=(32, 32), padding=4), RandomHorizontalFlip(p=0.5)]) # Same transformations as in the paper
+                 ):
         super().__init__()
         self.buffer = ReservoirBuffer(mem_size)
         self.alpha = alpha
