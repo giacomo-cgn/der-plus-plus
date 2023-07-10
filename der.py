@@ -9,13 +9,14 @@ import torch.nn.functional as F
 from torchvision.transforms import Compose, RandomCrop, RandomHorizontalFlip
 
 
-# Cusstom reservoir buffer class for samples, labels and logits
+# Custom reservoir buffer class for samples composed by input, label and logits
 class ReservoirBuffer:
     def __init__(self, buffer_size):
         self.buffer_size = buffer_size
         self.buffer = []
         self.stored_samples = 0
 
+    # Add a batch of samples to the buffer
     def add(self, batch_x, batch_y, batch_logits):
         assert batch_x.size(0) == batch_y.size(0) == batch_logits.size(0)
         batch_size = batch_x.size(0)
@@ -43,6 +44,7 @@ class ReservoirBuffer:
             
             self.stored_samples += batch_size
 
+    # Sample batch_size samples from the buffer
     def sample(self, batch_size):
         assert batch_size <= self.stored_samples
 
